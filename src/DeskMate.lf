@@ -1,0 +1,175 @@
+target C {
+    timeout: 30 sec,
+    fast: true,
+    single-threaded: true
+}
+
+preamble {=
+#include <stdio.h>
+
+#define DRIVE_STOP      0
+#define DRIVE_TO_CUP    1
+#define DRIVE_RETURN    2
+
+#define ARM_STOP        0
+#define ARM_LOWER       1
+#define ARM_CLOSE       2
+#define ARM_LIFT        3
+#define ARM_OPEN        4
+
+#define STATE_DRIVE_TO_CUP  1
+#define STATE_SETTLE        2
+#define STATE_LOWER_PICKUP  3
+#define STATE_CLOSE         4
+#define STATE_LIFT          5
+#define STATE_RETURN        6
+#define STATE_LOWER_DROP    7
+#define STATE_OPEN          8
+#define STATE_DONE          9
+=}
+
+reactor DriveController {
+    input command: int
+    output completed: int
+    logical action finish: int
+
+    reaction(command) -> finish {=
+        if (command->value == DRIVE_STOP) {
+            printf("[Drive] stopped\n");
+            lf_schedule_int(finish, 0, DRIVE_STOP);
+        } else if (command->value == DRIVE_TO_CUP) {
+            printf("[Drive] driving to cup\n");
+            lf_schedule_int(finish, SEC(2), DRIVE_TO_CUP);
+        } else if (command->value == DRIVE_RETURN) {
+            printf("[Drive] returning to start\n");
+            lf_schedule_int(finish, SEC(2), DRIVE_RETURN);
+        }
+    =}
+
+    reaction(finish) -> completed {=
+        printf("[Drive] movement completed\n");
+        lf_set(completed, finish->value);
+    =}
+}
+
+reactor ArmController {
+    input command: int
+    output completed: int
+    logical action finish: int
+
+    reaction(command) -> finish {=
+        if (command->value == ARM_STOP) {
+            printf("[Arm] stopped\n");
+            lf_schedule_int(finish, 0, ARM_STOP);
+        } else if (command->value == ARM_LOWER) {
+            printf("[Arm] lowering\n");
+            lf_schedule_int(finish, SEC(1), ARM_LOWER);
+        } else if (command->value == ARM_CLOSE) {
+            printf("[Arm] closing gripper\n");
+            lf_schedule_int(finish, SEC(1), ARM_CLOSE);
+        } else if (command->value == ARM_LIFT) {
+            printf("[Arm] lifting cup\n");
+            lf_schedule_int(finish, SEC(1), ARM_LIFT);
+        } else if (command->value == ARM_OPEN) {
+            printf("[Arm] opening gripper\n");
+            lf_schedule_int(finish, SEC(1), ARM_OPEN);
+        }
+    =}
+
+    reaction(finish) -> completed {=
+        printf("[Arm] movement completed\n");
+        lf_set(completed, finish->value);
+    =}
+}
+
+reactor RobotController {
+    input drive_completed: int
+    input arm_completed: int
+
+    output drive_command: int
+    output arm_command: int
+
+    logical action settled
+
+    state current_state: int = 1
+
+    reaction(startup) -> drive_command {=
+        printf("DeskMate Phase 1 starting\n");
+        printf("[Robot] DRIVE_TO_CUP\n");
+        lf_set(drive_command, DRIVE_TO_CUP);
+    =}
+
+    reaction(drive_completed) -> settled, arm_command {=
+        if (self->current_state == STATE_DRIVE_TO_CUP &&
+            drive_completed->value == DRIVE_TO_CUP) {
+
+            self->current_state = STATE_SETTLE;
+            printf("[Robot] SETTLE\n");
+            lf_schedule(settled, MSEC(500));
+
+        } else if (self->current_state == STATE_RETURN &&
+                   drive_completed->value == DRIVE_RETURN) {
+
+            self->current_state = STATE_LOWER_DROP;
+            printf("[Robot] LOWER_FOR_DROP\n");
+            lf_set(arm_command, ARM_LOWER);
+        }
+    =}
+
+    reaction(settled) -> arm_command {=
+        self->current_state = STATE_LOWER_PICKUP;
+        printf("[Robot] LOWER_FOR_PICKUP\n");
+        lf_set(arm_command, ARM_LOWER);
+    =}
+
+    reaction(arm_completed) -> arm_command, drive_command {=
+        if (self->current_state == STATE_LOWER_PICKUP &&
+            arm_completed->value == ARM_LOWER) {
+
+            self->current_state = STATE_CLOSE;
+            printf("[Robot] CLOSE_GRIPPER\n");
+            lf_set(arm_command, ARM_CLOSE);
+
+        } else if (self->current_state == STATE_CLOSE &&
+                   arm_completed->value == ARM_CLOSE) {
+
+            self->current_state = STATE_LIFT;
+            printf("[Robot] LIFT_CUP\n");
+            lf_set(arm_command, ARM_LIFT);
+
+        } else if (self->current_state == STATE_LIFT &&
+                   arm_completed->value == ARM_LIFT) {
+
+            self->current_state = STATE_RETURN;
+            printf("[Robot] RETURN_TO_START\n");
+            lf_set(drive_command, DRIVE_RETURN);
+
+        } else if (self->current_state == STATE_LOWER_DROP &&
+                   arm_completed->value == ARM_LOWER) {
+
+            self->current_state = STATE_OPEN;
+            printf("[Robot] OPEN_GRIPPER\n");
+            lf_set(arm_command, ARM_OPEN);
+
+        } else if (self->current_state == STATE_OPEN &&
+                   arm_completed->value == ARM_OPEN) {
+
+            self->current_state = STATE_DONE;
+            printf("[Robot] DONE\n");
+            printf("DeskMate completed the pickup sequence\n");
+            lf_request_stop();
+        }
+    =}
+}
+
+main reactor DeskMate {
+    robot = new RobotController()
+    drive = new DriveController()
+    arm = new ArmController()
+
+    robot.drive_command -> drive.command
+    drive.completed -> robot.drive_completed after 1 msec
+
+    robot.arm_command -> arm.command
+    arm.completed -> robot.arm_completed after 1 msec
+}
